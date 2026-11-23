@@ -360,8 +360,15 @@ namespace AZD
                 try
                 {
                     ushort len = (ushort)dat.Count();
-                    if (len <= 0) return false;
-                    dat = master.ReadHoldingRegisters(Address, RegAddr, len);
+                    if (len <= 0)
+                    {
+                        //原代码此处直接 return,LockObj 永不释放 -> 四个工站旋转轴共用的 RS485 总线全部 5s 超时卡死
+                        Monitor.Exit(LockObj);
+                        return false;
+                    }
+                    //原代码 dat = ... 只改了局部引用,调用方拿不到数据;改为拷贝回调用方数组
+                    ushort[] rd = master.ReadHoldingRegisters(Address, RegAddr, len);
+                    Array.Copy(rd, dat, Math.Min(rd.Length, dat.Length));
                     Monitor.Exit(LockObj);
                     return true;
                 }

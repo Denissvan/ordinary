@@ -64,7 +64,9 @@ namespace UI
             this.PortName = PortName;
             this.BaudRate = BaudRate;
 
-            ComDevice.DataReceived += new SerialDataReceivedEventHandler(SerialCom_DataReceived);
+            //先解绑再绑定:重复调用 InitSerialCom(如光源控制器重连)时避免同一事件被注册多次、一次收包触发多次处理
+            ComDevice.DataReceived -= SerialCom_DataReceived;
+            ComDevice.DataReceived += SerialCom_DataReceived;
             if (SerialPort.GetPortNames().Length == 0)
             {
                 VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}未发现可用串口", Description));
@@ -92,11 +94,8 @@ namespace UI
                     return false;
                 }
             }
-            else
-            {
-                ComDevice.Close();
-            }
-            return true;
+            //原逻辑在串口已打开时执行 ComDevice.Close() 却返回 true,导致调用方以为串口可用、后续发送全部失败
+            return ComDevice.IsOpen;
         }
 
         readonly object obj = new object();
@@ -124,13 +123,14 @@ namespace UI
                     //实现数据的解码与显示
                     DecodeASCIIData(ReDatas);
                     DecodeHexData(ReDatas);
-                    ComReceivedEvent(this, null);
+                    ComReceivedEvent?.Invoke(this, null);
                 }
             }
             catch(Exception ex)
             {
-                MessageBox.Show(ex.Message);
-                MessageBox.Show(ex.StackTrace);
+                //不能在串口接收线程里弹 MessageBox:模态框会一直挂住该串口的接收线程(并持有 obj 锁),
+                //无人点确定时后续所有数据都收不到,表现为扫码/光源"卡住"
+                VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}串口接收异常: {1}", Description, ex));
             }
             
         }
@@ -175,9 +175,17 @@ namespace UI
                     VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}串口没打开", Description));
                     if (bfrist)
                     {
-                        ComDevice.Open();
-                        goto Retry;
                         bfrist = false;
+                        try
+                        {
+                            ComDevice.Open();
+                        }
+                        catch (Exception)
+                        {
+                            //端口不存在/被占用时 Open 会抛异常,原代码未捕获会把异常抛到运动/测试线程
+                            return false;
+                        }
+                        goto Retry;
                     }
                 }
                 return false;
@@ -215,13 +223,12 @@ namespace UI
                         {
                             ComDevice.Open();
                         }
-                        catch(Exception ee)
+                        catch(Exception)
                         {
-                            bfrist = false;
                             return false;
                         }
-                        goto Retry;
                         bfrist = false;
+                        goto Retry;
                     }
                     //Logger.Error($"{Description}串口没打开");
                 }

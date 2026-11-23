@@ -7361,9 +7361,23 @@ RECHECKAGAIN:
                     else return res;
                 }
                 //工站取料
-                lock (pickws)
+                //只在本臂确实要工站取料时才争抢 pickws,且用有界 TryEnter。
+                //原 lock (pickws) 无条件阻塞:对臂在 PickWsMod 内持锁并等待双臂避障(需要本臂让开)时,
+                //本臂即使下一步是料盘取料/放料也会卡死在这里无法移动 -> 双臂互等,直到 30s 避障超时。
+                bool needPickWs = Proc == EM_STA.PICKWS && !bquit;
+                bool pickWsLockTaken = false;
+                try
                 {
-                    if (Proc == EM_STA.PICKWS && !bquit)
+                    if (needPickWs)
+                    {
+                        Monitor.TryEnter(pickws, 100, ref pickWsLockTaken);
+                        if (!pickWsLockTaken)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (pickWsLockTaken && Proc == EM_STA.PICKWS && !bquit)
                     {
                             Camcfgset();
                         //VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}工站取料进入!", disc));
@@ -7394,19 +7408,27 @@ RECHECKAGAIN:
                         //VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}工站取料退出!", disc));
                     }
                 }
+                finally
+                {
+                    if (pickWsLockTaken) Monitor.Exit(pickws);
+                }
 
 
-                //料盘放料
+                //料盘放料(仅在需要时争抢锁,避免对臂持锁时本臂无关步骤被挡住)
+                bool needPlaceTray = Proc == EM_STA.PLACETRAY && !bquit;
                 bool placeTrayLockTaken = false;
                 try
                 {
-                    Monitor.TryEnter(placetray, 100, ref placeTrayLockTaken);
-                    if (!placeTrayLockTaken)
+                    if (needPlaceTray)
                     {
-                        continue;
+                        Monitor.TryEnter(placetray, 100, ref placeTrayLockTaken);
+                        if (!placeTrayLockTaken)
+                        {
+                            continue;
+                        }
                     }
 
-                    if (Proc == EM_STA.PLACETRAY && !bquit)
+                    if (placeTrayLockTaken && Proc == EM_STA.PLACETRAY && !bquit)
                     {
                             Camcfgset();
 
@@ -7480,13 +7502,17 @@ RECHECKAGAIN:
                     if (placeTrayLockTaken) Monitor.Exit(placetray);
                 }
 
+                bool needPickTray = (Proc == EM_STA.FLYERRPLACE || Proc == EM_STA.MOTORCAMERRPLACE || Proc == EM_STA.PICKTRAY) && !bquit;
                 bool pickTrayLockTaken = false;
                 try
                 {
-                    Monitor.TryEnter(picktray, 100, ref pickTrayLockTaken);
-                    if (!pickTrayLockTaken)
+                    if (needPickTray)
                     {
-                        continue;
+                        Monitor.TryEnter(picktray, 100, ref pickTrayLockTaken);
+                        if (!pickTrayLockTaken)
+                        {
+                            continue;
+                        }
                     }
 
                     //飞拍失败放回
@@ -7622,16 +7648,20 @@ RECHECKAGAIN:
                 }
 
                 //工站放料
+                bool needPlaceWs = Proc == EM_STA.PLACEWS && !bquit;
                 bool placeWsLockTaken = false;
                 try
                 {
-                    Monitor.TryEnter(placews, 100, ref placeWsLockTaken);
-                    if (!placeWsLockTaken)
+                    if (needPlaceWs)
                     {
-                        continue;
+                        Monitor.TryEnter(placews, 100, ref placeWsLockTaken);
+                        if (!placeWsLockTaken)
+                        {
+                            continue;
+                        }
                     }
 
-                    if (Proc == EM_STA.PLACEWS && !bquit)
+                    if (placeWsLockTaken && Proc == EM_STA.PLACEWS && !bquit)
                     {
                         Camcfgset();
                         // VAR.msg.AddMsg(Msg.EM_MSGTYPE.ERR, string.Format("{0}工站放料进入!", disc));
