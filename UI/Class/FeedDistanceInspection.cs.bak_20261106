@@ -1,0 +1,215 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Windows.Forms;
+using MotionCtrl;
+using UI.Class;
+
+namespace UI
+{
+    internal static class FeedDistanceInspection
+    {
+        private static readonly FeedDistanceInspectionState state = new FeedDistanceInspectionState();
+        private static readonly object scheduleSync = new object();
+        public static bool IsActive { get { return state.IsInspecting; } }
+
+        private static bool SkipHardware
+        {
+            get { return VAR.ClearMt || WS.Demo || COM.UDLoad1.Demo || COM.UDLoad2.Demo; }
+        }
+
+        private static bool Cancelled()
+        {
+            return VAR.gsys_set.bquit || VAR.gsys_set.bclose || WS.bquit || WS.bpause || UpDownLoad.bquit;
+        }
+
+        public static void RequestEnvironmentCheck()
+        {
+            lock (scheduleSync)
+            {
+                if (PT_SET.FeedDistanceCheckEnabled) state.Request();
+                AutoInspectionParameter.ifcheckontime = true;
+                AutoInspectionParameter.ifcheck = false;
+            }
+        }
+
+        public static void BeginRun()
+        {
+            state.RevokeLoading();
+        }
+
+        public static void AuthorizeLoading(WS ws)
+        {
+            if (!Cancelled()) state.AuthorizeLoading(ws.num);
+        }
+
+        public static bool TryBeginLoading(WS ws, out IDisposable scope)
+        {
+            bool requireAdmission = PT_SET.FeedDistanceCheckEnabled && !SkipHardware && ws.num + 1 == PT_SET.CheckWs;
+            return state.TryBeginLoading(ws.num, requireAdmission, out scope);
+        }
+
+        public static bool TryBeginMotion(out IDisposable scope)
+        {
+            return state.TryBeginMotion(out scope);
+        }
+
+        public static void TryResetEnvironmentCycle(WS ws)
+        {
+            lock (scheduleSync)
+            {
+                if (ws.num + 1 != PT_SET.CheckWs || VAR.ClearMt) return;
+                bool feedOnly = PT_SET.FeedDistanceCheckEnabled && !PT_SET.AFC_distance_check_open &&
+                    !PT_SET.DCC_distance_check_open && !PT_SET.OTP_distance_check_open &&
+                    !PT_SET.AFC_luxcct_check_open && !PT_SET.DCC_luxcct_check_open && !PT_SET.OTP_luxcct_check_open;
+                if (PT_SET.FeedDistanceCheckEnabled && (SkipHardware || state.HasPending)) return;
+                if (!AutoInspectionParameter.ifcheck && !(feedOnly && state.HasCompleted && AutoInspectionParameter.ifcheckontime)) return;
+                AutoInspectionParameter.ifcheckontime_enabled = false;
+                AutoInspectionParameter._elapsedMilliseconds = 0;
+                AutoInspectionParameter.ifcheckontime = false;
+                AutoInspectionParameter.ifcheck = false;
+                VAR.msg.AddMsg(Msg.EM_MSGTYPE.DBG, string.Format("{0}重置机台点检状态", ws.num + 1));
+            }
+        }
+
+        public static EM_RES RunBeforeFeed(WS ws)
+        {
+            if (!PT_SET.FeedDistanceCheckEnabled || ws.num + 1 != PT_SET.CheckWs || !state.HasPending) return EM_RES.OK;
+            if (SkipHardware)
+            {
+                VAR.msg.AddMsg(Msg.EM_MSGTYPE.DBG, ws.disc + " 上下料面距离点检跳过：清料或空跑，本轮仍待检");
+                return EM_RES.OK;
+            }
+            long cycle;
+            if (!state.TryBeginInspection(out cycle))
+            {
+                VAR.msg.AddMsg(Msg.EM_MSGTYPE.DBG, ws.disc + " 上下料面距离点检延后：已有运动流程，本轮仍待检");
+                return EM_RES.OK;
+            }
+            bool passed = false;
+            try
+            {
+                while (!Cancelled())
+                {
+                    string error;
+                    EM_RES res = Measure(ws, cycle, out error);
+                    if (res == EM_RES.OK && !Cancelled())
+                    {
+                        passed = true;
+                        return EM_RES.OK;
+                    }
+                    if (res == EM_RES.QUIT || Cancelled()) return EM_RES.QUIT;
+                    VAR.sys_inf.Set(EM_ALM_STA.WAR_RED_FLASH, "上下料面距离点检失败", 20, true);
+                    var warn = new MT.ST_WARN();
+                    warn.title = "上下料面距离点检失败";
+                    warn.msg = ws.disc + "：" + error;
+                    warn.lb_msg = warn.msg + "\r\n重新测量：重新检查条件并测距。\r\n停止：保留本轮待检状态。";
+                    warn.ok_txt = "重新测量";
+                    warn.abort_txt = "停止";
+                    DialogResult choice = MT.Display_frwarn(new warning(), warn, ERR_ALM.EmErrItem.CaptureAbnomal);
+                    if (choice != DialogResult.Yes || Cancelled()) return EM_RES.QUIT;
+                    VAR.msg.AddMsg(Msg.EM_MSGTYPE.NOR, ws.disc + " 上下料面距离点检选择重新测量");
+                    VAR.sys_inf.Set(EM_ALM_STA.NOR_GREEN, "运行", 0, true);
+                }
+                return EM_RES.QUIT;
+            }
+            finally
+            {
+                state.EndInspection(cycle, passed);
+                VAR.msg.AddMsg(passed ? Msg.EM_MSGTYPE.NOR : Msg.EM_MSGTYPE.WAR,
+                    string.Format("上下料面距离点检结束：周期={0}，工站={1}，结果={2}，仍待检={3}", cycle, ws.disc, passed ? "通过" : "未通过/停止", state.HasPending));
+            }
+        }
+
+        private static bool AxisStopped(AXIS axis)
+        {
+            return axis != null && axis.card != null && axis.card.isReady && axis.home_status == AXIS.HOME_STA.OK &&
+                !axis.isALM && axis.isStop;
+        }
+
+        private static bool ArmClear(UpDownLoad arm, bool left)
+        {
+            if (arm == null || arm.brun_ud || (arm.UpDownTask != null && !arm.UpDownTask.IsCompleted)) return false;
+            if (!AxisStopped(arm.ax_x) || !AxisStopped(arm.ax_y) || !AxisStopped(arm.ax_z)) return false;
+            if (arm.ax_u1 != null && !AxisStopped(arm.ax_u1)) return false;
+            if (arm.ax_u2 != null && !AxisStopped(arm.ax_u2)) return false;
+            if (arm.list_xt == null || arm.list_xt.Count < 2) return false;
+            bool xClear = arm.ax_x.isORG || (left ? arm.ax_x.fenc_pos <= 3 : arm.ax_x.fenc_pos >= -3);
+            return xClear && arm.ax_y.fenc_pos <= arm.list_xt[1].st_cap_pos.y + 3 && Math.Abs(arm.ax_z.fenc_pos) <= 3;
+        }
+
+        private static bool SafeToMeasure(WS ws)
+        {
+            if (!MT.CARD_ECI2400_0.isReady || MT.CARD_ECI2400_0.UpdateIOBuff(true) != EM_RES.OK) return false;
+            return !Turntable.NeedRecovery && Turntable.GetWSOnFeedPos == ws &&
+                MT.GPIO_IN_TT_INP.isON && MT.GPIO_IN_TT_MOVE.isOFF && MT.GPIO_IN_TT_ALM.isOFF &&
+                MT.GPIO_OUT_TT_FWD.isOFF && MT.GPIO_OUT_TT_REV.isOFF &&
+                ws.isInTestPos && ArmClear(COM.UDLoad1, true) && ArmClear(COM.UDLoad2, false);
+        }
+
+        private static EM_RES Measure(WS ws, long cycle, out string error)
+        {
+            error = "";
+            string port = PT_SET.COM_1;
+            double standard = PT_SET.FeedDistanceStandard;
+            double tolerance = PT_SET.FeedDistanceTolerance;
+            double compensation = PT_SET.FeedDistanceCompensation;
+            double deviation;
+            if (string.IsNullOrWhiteSpace(port) || !FeedDistanceInspectionState.IsPass(standard, standard, tolerance, 0, out deviation) ||
+                !FeedDistanceInspectionState.IsFinite(compensation) || !FeedDistanceInspectionState.IsFinite(PT_SET.distance_coefficient) || PT_SET.distance_coefficient <= 0)
+            {
+                error = "COM口或距离参数无效";
+                return EM_RES.PARA_ERR;
+            }
+            var guard = WS.ComPortGuard.Get(port);
+            bool locked = false;
+            SerialCommander comm = null;
+            EM_RES result = EM_RES.ERR;
+            double actual = double.NaN;
+            var timer = Stopwatch.StartNew();
+            try
+            {
+                VAR.msg.AddMsg(Msg.EM_MSGTYPE.NOR, string.Format("上下料面距离点检开始：周期={0}，工站={1}，COM={2}，标准={3}，阈值={4}，补偿={5}", cycle, ws.disc, port, standard, tolerance, compensation));
+                while (!(locked = guard.Wait(50)))
+                {
+                    if (Cancelled()) throw new OperationCanceledException();
+                    if (timer.ElapsedMilliseconds >= 15000) throw new TimeoutException("等待整合COM口超时");
+                }
+                if (Cancelled()) throw new OperationCanceledException();
+                if (!SafeToMeasure(ws)) throw new InvalidOperationException("转盘、工站测试姿态或双臂退出条件不满足，禁止测距");
+                comm = new SerialCommander(port, 115200, 1000);
+                comm.SetLaserStatus(true);
+                for (int i = 0; i < 20; i++)
+                {
+                    if (Cancelled()) throw new OperationCanceledException();
+                    Thread.Sleep(50);
+                }
+                actual = comm.ReadInspectionDistance(10000, Cancelled);
+                if (!SafeToMeasure(ws)) throw new InvalidOperationException("测距期间运动安全条件发生变化，本次数据无效");
+                bool pass = FeedDistanceInspectionState.IsPass(actual, standard, tolerance, compensation, out deviation);
+                error = pass ? "" : string.Format("距离无效或超限：实测={0}，补偿={1}，标准={2}，偏差={3}，阈值={4}", actual, compensation, standard, deviation, tolerance);
+                result = pass ? EM_RES.OK : EM_RES.ERR;
+            }
+            catch (OperationCanceledException) { result = EM_RES.QUIT; error = "停止或暂停，本轮仍待检"; }
+            catch (Exception ex) { result = EM_RES.ERR; error = ex.Message; }
+            finally
+            {
+                if (comm != null)
+                {
+                    try { comm.SetLaserStatus(false); }
+                    catch (Exception ex) { result = EM_RES.ERR; error += "；关闭测距指令发送失败：" + ex.Message; }
+                    try { comm.Dispose(); }
+                    catch (Exception ex) { result = EM_RES.ERR; error += "；释放COM失败：" + ex.Message; }
+                }
+                if (locked) guard.Release();
+            }
+            if (Cancelled() && result == EM_RES.OK) { result = EM_RES.QUIT; error = "停止或暂停，本轮仍待检"; }
+            VAR.msg.AddMsg(result == EM_RES.OK ? Msg.EM_MSGTYPE.NOR : Msg.EM_MSGTYPE.ERR,
+                string.Format("上下料面距离点检数据：周期={0}，工站={1}，实测={2}，补偿={3}，标准={4}，偏差={5}，阈值={6}，结果={7}，说明={8}",
+                    cycle, ws.disc, actual, compensation, standard, Math.Abs(actual + compensation - standard), tolerance, result, error));
+            if (result == EM_RES.OK)
+                AutoInspectionParameter.SaveToTxt("上下料面距离参数", ws.disc, cycle, actual, compensation, standard, tolerance, result);
+            return result;
+        }
+    }
+}
