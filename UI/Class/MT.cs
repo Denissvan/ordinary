@@ -1814,7 +1814,10 @@ namespace UI
                     }
 
                     double allowedOtherExtent = EffectiveDualArmCombinedExtentLimit - requestedExtent - DualArmYieldMargin;
-                    if (PT_SET.bSpecialDualArmAvoidance && allowedOtherExtent >= 0)
+                    //普通避障也登记让位请求:对臂若因步骤锁被本臂占用而原地空转(如本臂持 placews 等避障、
+                    //对臂下一步也是 PLACEWS),对臂会在循环顶部消费该请求向内让位,打破互等。
+                    //普通模式下对臂只在"步骤锁拿不到"时才消费,正常流程不受影响。
+                    if (allowedOtherExtent >= 0)
                     {
                         yieldGeneration = QueueDualArmYieldRequestUnsafe(otherId, armId, requestedExtent, allowedOtherExtent);
                     }

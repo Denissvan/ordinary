@@ -261,6 +261,9 @@ namespace UI
         public bool Ischeckcode=true;
         public bool bOnlyOneXt = false;
         private int dualArmYieldDeferredGeneration;
+        //本臂上一轮因步骤锁(pickws/placetray/picktray/placews)被对臂占用而未能进入步骤。
+        //普通避障模式下只在此时消费对臂的让位请求,避免"对臂持锁等本臂让开、本臂等锁不动"的互等。
+        private bool stepLockBlocked;
         #endregion
 
         #region 硬件
@@ -448,7 +451,9 @@ namespace UI
 
         private EM_RES ProcessPendingSpecialDualArmYield(ref bool bquit)
         {
-            if (!PT_SET.bSpecialDualArmAvoidance) return EM_RES.OK;
+            bool blockedOnStepLock = stepLockBlocked;
+            stepLockBlocked = false;
+            if (!PT_SET.bSpecialDualArmAvoidance && !blockedOnStepLock) return EM_RES.OK;
 
             int generation;
             double targetX;
@@ -7373,6 +7378,7 @@ RECHECKAGAIN:
                         Monitor.TryEnter(pickws, 100, ref pickWsLockTaken);
                         if (!pickWsLockTaken)
                         {
+                            stepLockBlocked = true;
                             continue;
                         }
                     }
@@ -7424,6 +7430,7 @@ RECHECKAGAIN:
                         Monitor.TryEnter(placetray, 100, ref placeTrayLockTaken);
                         if (!placeTrayLockTaken)
                         {
+                            stepLockBlocked = true;
                             continue;
                         }
                     }
@@ -7511,6 +7518,7 @@ RECHECKAGAIN:
                         Monitor.TryEnter(picktray, 100, ref pickTrayLockTaken);
                         if (!pickTrayLockTaken)
                         {
+                            stepLockBlocked = true;
                             continue;
                         }
                     }
@@ -7657,6 +7665,7 @@ RECHECKAGAIN:
                         Monitor.TryEnter(placews, 100, ref placeWsLockTaken);
                         if (!placeWsLockTaken)
                         {
+                            stepLockBlocked = true;
                             continue;
                         }
                     }

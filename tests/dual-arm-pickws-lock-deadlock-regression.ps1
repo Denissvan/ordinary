@@ -40,4 +40,26 @@ foreach ($c in $cases) {
     }
 }
 
+# 2026-11-24 log (V3.0.0.30, 13:09:30 / 13:12:04): module 2 held placews in PLACEWS waiting for
+# avoidance, module 1 finished PICKTRAY at X=203 with nextProc=PLACEWS and spun on TryEnter(placews)
+# without moving. With special avoidance off nobody yielded -> 30 s timeout -> whole run stopped.
+foreach ($c in $cases) {
+    $blocked = "if (!$($c.Taken))"
+    $i = $source.IndexOf($blocked, [System.StringComparison]::Ordinal)
+    $flag = $source.IndexOf('stepLockBlocked = true;', $i, [System.StringComparison]::Ordinal)
+    $cont = $source.IndexOf('continue;', $i, [System.StringComparison]::Ordinal)
+    if ($i -lt 0 -or $flag -lt 0 -or $flag -gt $cont) {
+        throw "A busy $($c.Lock) lock must mark stepLockBlocked so the arm yields to a waiting peer."
+    }
+}
+if (-not $source.Contains('if (!PT_SET.bSpecialDualArmAvoidance && !blockedOnStepLock) return EM_RES.OK;')) {
+    throw 'An arm blocked on a step lock must consume the peer yield request even without special avoidance.'
+}
+$mt = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'UI\Class\MT.cs')
+if ($mt.Contains('if (PT_SET.bSpecialDualArmAvoidance && allowedOtherExtent >= 0)
+                    {
+                        yieldGeneration')) {
+    throw 'Yield requests must be queued in normal avoidance mode too.'
+}
+
 Write-Host 'PASS: step locks are only contended when needed and never block an arm the other arm is waiting on.'
